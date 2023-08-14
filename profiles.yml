@@ -1,0 +1,25 @@
+vars: #file level variables
+  varA: 1
+
+definitions:
+  - &connection_basic
+    account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+    user: "{{ env_var('SNOWFLAKE_USER') }}"
+    password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+    role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+    warehouse: COMPUTE_WH
+
+profiles:
+  default: dev
+  targets:
+    dev:
+      <<: *connection_basic
+      # merge with keys below
+      database: TEST #PLAYGROUND_DEV
+      schema: PUBLIC
+      
+    test: 
+      <<: *connection_basic
+      # merge with keys below
+      database: PLAYGROUND_TEST
+      schema: PUBLIC
