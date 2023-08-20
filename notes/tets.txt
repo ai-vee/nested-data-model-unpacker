@@ -1,0 +1,16 @@
+--------
+[ { "name": "John", "age": 30, "address": { "street": "123 Main St", "city": "Anytown" }, "hobbies": [ { "activity": "reading", "duration": "2 hours" }, { "activity": "swimming", "location": "pool" }, { "activity": "hiking", "location": "mountain" } ] } ]
+------
+[ { "name": "John", "age": 30, "address": { "street": "123 Main St", "city": "Anytown", "coordinates": { "latitude": "12.3456", "longitude": "78.9012", "historical_data": [ { "year": 2020, "value": 34.5 }, { "year": 2021, "value": 32.8 }, { "year": 2022, "value": 30.1 } ] } }, "hobbies": [ { "activity": "reading", "duration": "2 hours", "rank": 1 }, { "activity": "swimming", "location": "pool", "rank": 2 }, { "activity": "hiking", "location": "mountain", "rank": 3 } ], "favorites": { "colors": [ { "shade": "red", "hex": "#FF0000" }, { "shade": "blue", "hex": "#0000FF" }, { "shade": "green", "hex": "#008000" } ], "foods": [ { "item": "pizza", "origin": "Italy" }, { "item": "burger", "origin": "USA" }, { "item": "salad", "type": "vegetable" } ] } } ]
+-----
+[
+    {
+        "name": "John",
+        "age": 30,
+        "address": {
+            "street": "123 Main St",
+            "city": "Anytown"
+        },
+        "hobbies": [ "reading", "swimming"]
+    }
+]
