@@ -1,0 +1,542 @@
+###########################################################################################
+unpack_json_document.py
+###########################################################################################
+# todo: deploy logger package and uncomment logger statements
+import snowflake.snowpark as snowpark
+
+def main(session: snowpark.Session,  params: dict = {}) -> list:
+    def unpack_json_document(
+        *,
+        input_relation: str,
+        output_schema: str,
+        log_relation: str,
+        file_id: str  = ',',
+        detect_dtype_from_first: int = 2000,
+        max_recursive_calls: int = 500,
+        output_table_prefix: str = "UNPACKED__",
+        output_table_suffix: str = "",
+        exclude: list = ['INGESTION_CTRL'],
+        combine_with_array_hashed_field: list = ['DATASET_SERVICE_OF'],
+        **kwargs
+    ) -> list:
+        """Generate data models comprising of 1:1 and 1:M relationship objects 
+        encapsulated in a mutilayered nested JSON document. 
+        It will evole schema when writin to existing tables
+        """
+        import snowflake.snowpark as snowpark
+        import snowflake.snowpark.functions as F
+        import snowflake.snowpark.types as T
+
+        from procedures.libs.evolve_schema import evolve_schema
+
+        from logger import Logger
+
+        logger = Logger.logger
+        # logger.warn(log_relation)
+        df = session.table(input_relation)
+
+        # * HELPER FUNCS
+        @Logger.log(log_kwargs=["obj_field"])
+        def expand_object_subfields(
+            session: snowpark.Session, 
+            df: snowpark.DataFrame, 
+            obj_field: str
+        ) -> snowpark.DataFrame:
+            """Expand the obj field's subfields to additional columns of the provided DataFrame
+            """
+            
+            key_dtype_pairs = (
+                df.select(obj_field)
+                .distinct()
+                .join_table_function(
+                    "flatten", input=F.col(obj_field), mode=F.lit("OBJECT"), outer=F.lit(True)
+                )
+                .select("KEY", F.typeof("VALUE").as_("DTYPE"))
+                .filter(F.col("KEY").isNotNull())
+                .distinct()
+                .group_by("KEY")
+                .agg(F.array_agg(F.col("DTYPE")).as_("DTYPES"))
+            )
+            
+            # ! the module below must be imported in the session since we register udf from another py module.
+            import procedures.libs.datatype_conversion_order as datatype_conversion_order
+        
+            get_highest_dtype_precedence = F.udf(
+                datatype_conversion_order.get_highest_order_dtype, 
+                return_type=T.StringType()
+            )
+            result = key_dtype_pairs.select(
+                "KEY", get_highest_dtype_precedence("DTYPES").alias("HIGEST_PRECEDENCE_DTYPE")
+            )
+
+            converted_key_dtype_pairs = [row.as_dict() for row in result.collect()]
+            # todo: {obj_field}__{pair['KEY']} subfield create a very long column name
+            col_subfield_names, col_subfield_values = zip(
+                *[
+                    (
+                        f"{obj_field.split('__')[-1]}__{pair['KEY']}",
+                        F.col(obj_field)[pair["KEY"]]._cast(pair["HIGEST_PRECEDENCE_DTYPE"]),
+                    )
+                    for pair in converted_key_dtype_pairs
+                ]
+            )
+            df = df.with_columns(col_subfield_names, col_subfield_values)
+            logger.debug("Expanded all subfields and drop the parent obj field.")
+            return df
+        
+        # from procedures.libs.flatten_array import flatten_array
+        @Logger.log(log_kwargs=['array_field'])
+        def flatten_array(
+                session: snowpark.Session, 
+                df: snowpark.DataFrame, 
+                array_field: str) -> snowpark.DataFrame:
+            """Explode a distinct Array instances of the specified field, 
+            with each Array row's combound values into multiple rows.
+            """
+            
+            DROPPED_COLS = ['SEQ','KEY','PATH','INDEX','THIS'] #Extra cols we dont need after flatten
+            hash_field = f"{array_field}_SHA256"
+            unique_arr_instances = (df.select(hash_field, array_field, 'INGESTION_CTRL', 'DATASET_SERVICE_OF', F.expr('current_timestamp as FLATTEN_AT')).distinct()) #to reduce the no. instances to flatten
+            flatten_result = (unique_arr_instances
+                                        .join_table_function('flatten',
+                                                                input=F.col(array_field),
+                                                                mode=F.lit('ARRAY'), 
+                                                                outer=F.lit(True))
+                                        .drop(*DROPPED_COLS, array_field)
+                                        .with_column_renamed('VALUE', array_field))
+            logger.debug('"%s" after flatten generated a new df of %d rows', array_field, flatten_result.count())
+            return flatten_result
+
+    
+        processed_fields = set()
+
+        @Logger.log(log_kwargs=["parent_path"])
+        def recursive_unpacker(df: snowpark.DataFrame, parent_path="", counter=0) -> None:
+            """Resursively flatten each array and object columns.
+            """
+            counter += 1
+            exception_list = exclude + ["SHA256"]
+            cur_unprocessed_fields = set(
+                [
+                    col
+                    for col in df.columns
+                    if all(x not in col for x in exception_list)
+                    and col not in processed_fields
+                ]
+            )
+            if len(cur_unprocessed_fields) == 0 or counter == max_recursive_calls:
+                logger.debug("Terminated at %s recursive calls", counter)
+                return
+
+            new_dfs = dict()
+            for cur_field in cur_unprocessed_fields:
+                # cast curfield to variant to conduct type detection
+                target = df.select(
+                    F.col(cur_field).cast(T.VariantType()).alias(cur_field)
+                ).distinct()
+                to_unpack_cur_field_dtypes = (
+                    target.limit(detect_dtype_from_first)
+                    .select(F.typeof(F.col(cur_field)).as_("TYPEOF"))
+                    .distinct()
+                    .filter(F.col("TYPEOF").isin(F.lit("ARRAY"), F.lit("OBJECT")))
+                ).collect()
+
+                distinct_to_unpack_type_count = len(to_unpack_cur_field_dtypes)
+                if distinct_to_unpack_type_count > 1:
+                    raise TypeError(
+                        '"%s" does not have a unique dtype of either ARRAY or OBJECT.'
+                    )
+                
+                elif distinct_to_unpack_type_count == 1:
+                    dtype = to_unpack_cur_field_dtypes[0].__getitem__("TYPEOF")
+                    match dtype:
+                        case "ARRAY":
+                            hash_field = f"{cur_field}_SHA256"
+                            df = df.with_column(
+                                hash_field,
+                                F.concat_ws(
+                                    F.lit(' | '),
+                                    F.sha2(F.col(cur_field).cast(T.StringType()), 256),
+                                    *[F.coalesce(F.col(field), F.lit(f'Non Defined {field}'))
+                                        for field in combine_with_array_hashed_field]
+                                )
+                            )
+                            new_df = flatten_array(session, df, array_field=cur_field)
+
+                            new_dfs[cur_field] = new_df
+                        case "OBJECT":
+                            df = expand_object_subfields(session, df, obj_field=cur_field)
+                            processed_fields.add(cur_field)
+                    df = df.drop(cur_field)
+                
+                else:
+                    processed_fields.add(cur_field)
+
+            globals()[
+                f"INTERNAL_RESULT_{output_table_prefix}{parent_path}{output_table_suffix}"
+            ] = df
+            recursive_unpacker(df, parent_path=parent_path, counter=counter)
+
+            for name, df in new_dfs.items():
+                recursive_unpacker(df, parent_path=name, counter=counter)
+
+        # * CALL MAIN FUNC
+        recursive_unpacker(df, parent_path=input_relation.split(".")[-1].replace(file_id,''))
+        results = {
+            k.replace("INTERNAL_RESULT_", ""): v
+            for k, v in globals().items()
+            if "INTERNAL_RESULT" in k
+        }
+        result_df: snowpark.DataFrame
+        written_tables = []
+        for name, result_df in results.items():
+            result_df.show(1)
+            result_relation = f"{output_schema}.{name}"
+            evolve_schema(session=session, to_merge=result_df.columns, target_relation=result_relation)
+            result_df.write.save_as_table(result_relation, mode="append", column_order="name")
+            written_tables.append(result_relation)
+        
+        ctrl_fields = [F.col(field)
+                        for field in combine_with_array_hashed_field]
+        
+        logs = df.select('INGESTION_CTRL', *ctrl_fields, F.expr('current_timestamp as FLATTEN_AT'))
+        logs.write.save_as_table(log_relation, mode='append')
+        return written_tables
+
+    return unpack_json_document(**params)
+
+
+###########################################################################################
+ingest_and_unpack_json_document
+###########################################################################################
+import snowflake.snowpark as snowpark
+
+
+config = dict(
+    name='ingest_and_unpack_json_document',
+    replace=True,
+    is_permanent=True, 
+    stage_location="@py_stage", 
+    packages=["colorlog"],
+    handler = 'main',
+    params = [
+        { "file_name": "Unit_Record_Actuary___Accidents__2009.json", "framework": "Ingestion", "container_folder_path": "INPUT/testing", "container_master_path": "int-ctp", "trigger_time": "2023-08-19T23:00:49.6204648Z", "admin_config": { "on_failure": [ { "email": "ivy.ly@finity.com.au" } ], "on_success": [ { "email": "ivy.ly@finity.com.au" } ] }, "processing_type": "file_drop", "metastore_environment": { "account": "finity.australia-east.azure", "database": "INT_FRAMEWORKS_SBX" }, "framework_url": "https://finityconsulting.atlassian.net/wiki/spaces/DATA/pages/1885634619/Ingestion+Framework", "preserved_dir": "" },
+        { "dataset": { "columns": "", "create_table_ddl": "", "format": { "sink": { "add_row_id": False, "allow_ingestion_framework_to_add_ctrl_column": True, "error_on_column_count_mismatch": True, "name": "UNIT_RECORD_ACTUARY_ACCIDENTS", "table_comment": "quarterly data provided by SunCorp", "trim_space": True, "type": "snowflake_table" }, "source": { "name": "Unit_Record_Actuary___Accidents__2009.json", "name_pattern": "Unit_Record_Actuary___Accidents%", "plugin": { "procedure": { "name": "ingest_and_unpack_json_document", "params": { "output_table_prefix": "", "output_table_suffix": "__STRUCTURED" } } }, "schema_detection": True, "type": "json" } }, "metadata": { "contract": { "access_policy": "Finity Internal", "business_description": "quarterly data provided by SunCorp", "classification": "Internal", "ingestion": { "freshness": "quarterly", "notifications": { "on_failure": [ { "email": "Ivy.Ly@finity.com.au" } ], "on_success": [ { "email": "Ivy.Ly@finity.com.au" } ] }, "tool": "Ingestion Framework" }, "owners": [ "Ivy.Ly@finity.com.au" ], "tags": [ "int", "ctp", "act" ], "technical_description": "Ingest with Ingestion Framework keeping all historical changes in RAW layer" } }, "name": "Unit_Record_Actuary___Accidents", "node_path": "frameworks_config/int-ctp/ingestions/quarterly-data/Unit_Record_Actuary___Accidents.yml" }, "enabled": True, "integration_services": { "sink": { "connection": { "account": "finity.australia-east.azure", "database": "INT_CTP_INDUSTRY_SBX", "schema": "ACT_RAW" }, "integration_runtime": "auto", "platform": "snowflake" }, "source": { "connection": { "container": "int-ctp", "folder": "raw" }, "integration_runtime": "auto", "platform": "azure_storage" } }, "name": "sbx", "sha256": "e30c60bed0c7699ba9131e243e40f72b54b0ca7d084048b4cad9bdd296ea35cd" },
+        {
+            "output_table_prefix": "",
+            "output_table_suffix": "__STRUCTURED"
+        }
+        # { "container_folder_path": "INPUT/testing", "file_name": "doc3.json" },
+        # { "dataset": { "format": { "sink": { "add_row_id": False, "allow_ingestion_framework_to_add_ctrl_column": True, "error_on_column_count_mismatch": True, "name": "DUMMY_TEST2", "table_comment": "quarterly data provided by SunCorp", "trim_space": True, "type": "snowflake_table" }, "source": { "name": "Unit_Record_Actuary___Accidents__2303.json", "name_pattern": "Unit_Record_Actuary___Accidents%", "plugin": { "procedure": { "name": "split_and_ingest_json_document", "params": { "size_threshold": 4 } } }, "schema_detection": True, "type": "json" } } }, "enabled": True, "integration_services": { "sink": { "connection": { "account": "finity.australia-east.azure", "database": "INT_CTP_INDUSTRY_SBX", "schema": "ACT_RAW" }, "integration_runtime": "auto", "platform": "snowflake" }, "source": { "connection": { "container": "int-ctp", "folder": "raw" }, "integration_runtime": "auto", "platform": "azure_storage" } }, "name": "sbx", "sha256": "ceb80b248a7911746cf638beab974a0221ed40b2b5e0e710ae316aeea6021727" },
+        # {
+        #     "output_table_prefix": "",
+        #     "output_table_suffix": "__STRUCTURED"
+        # }
+    ]
+)
+
+
+
+def main(
+        session: snowpark.Session,
+        trigger_meta: dict = None,
+        data_config: dict = None,
+        params: dict = {}
+        ) -> dict:
+    
+    from typing import Literal
+    from procedures.unpack_json_document import main
+    from procedures.libs.metadata import FrameworkOrchestrationMeta
+    from dataclasses import asdict
+    from datetime import datetime
+
+    # from logger import Logger
+    # session.add_import('@INT_FRAMEWORKS_SBX.SERVICES.py_stage/logger.py', 'logger')
+    from logger import Logger
+    logger_ = Logger.logger
+
+    # Extract mandatory args from metadata
+    extracted_meta = FrameworkOrchestrationMeta(trigger_meta, data_config)
+    
+    kwargs = {**asdict(extracted_meta), **params}
+
+    def extract_params_for_unpacking(
+            *,
+            input_relation: str,
+            output_schema: str,
+            log_relation: str,
+            file_id: str,
+            **kwargs) -> dict:
+        
+        unpack_params = { 
+                            **kwargs,
+                            **dict(
+                                input_relation = input_relation,
+                                output_schema = output_schema,
+                                log_relation = log_relation,
+                                file_id = file_id
+                            )
+                        }
+        return unpack_params
+
+    def split_and_read_json(
+            *,
+            snowflake_path: str,
+            sink_database:str,
+            sink_schema: str,
+            sink_table: str,
+            logs_name: str = 'LOGS_UNPACK_JSON_DOCUMENT',
+            size_threshold: int = 16,
+            table_type: Literal['', 'temp', 'temporary', 'transient'] = '',
+            recursive_unpack: bool = True,
+            **kwargs
+    ):
+        import json
+        from procedures.libs.metadata import DocumentSplitPlan, IngestionCtrl, MetadataDataFrame
+        from procedures.libs.save_as_table_ import save_as_evolve_schema_table
+        from hashlib import md5
+        
+        # if file_name and container folder_path are not provided via others
+        # extract from path
+        file_name = kwargs.get('file_name', None) or snowflake_path.split('/')[-1]
+        file_id = file_name + datetime.now().__str__() 
+        file_id = md5(file_id.encode()).hexdigest()
+        
+        container_folder_path = kwargs.get('container_folder_path', None) or snowflake_path.replace(file_name,'')
+        output_schema = f"{sink_database}.{sink_schema}"
+        # output_relation =  f"{output_schema}.{sink_table}"
+        temp_output_relation = f"{output_schema}.{sink_table}{file_id}"
+        log_relation = f"{output_schema}.{logs_name}"
+
+        file_bytes = session.file.get_stream(snowflake_path)
+        decoded_content = file_bytes.read().decode()
+        data_size = decoded_content.__sizeof__()
+        data = json.loads(decoded_content)
+        split_plan = DocumentSplitPlan(data_size, len(data), size_threshold)
+
+        if len(split_plan.data_splits) > 1:
+            start_idx = 0
+            for i, name in enumerate(split_plan.data_splits):
+                if i != (len(split_plan.data_splits) - 1):
+                    end_idx = start_idx + DocumentSplitPlan.incremental_unit 
+                    split_data = data[start_idx:end_idx]
+                    start_idx = (i+1)*DocumentSplitPlan.incremental_unit
+                else:
+                    split_data = data[start_idx:]
+
+                # prep metadata
+                split_file_name = f"{file_name.split('.')[0]}{name.split('__')[-1]}"
+                ingestion_ctrl = IngestionCtrl(split_file_name, container_folder_path)
+                meta = {
+                    "ingestion_ctrl": asdict(ingestion_ctrl),
+                    "dataset_service_of": ingestion_ctrl.file_name
+                    }
+
+                if len(split_data) > 0:
+                    df_with_meta = MetadataDataFrame(split_data, meta=meta)
+                    written_table = save_as_evolve_schema_table(session, df_with_meta, temp_output_relation, table_type)
+                    unpacked_nested_tables = main(
+                        session,
+                        extract_params_for_unpacking( 
+                            input_relation=written_table,
+                            output_schema=output_schema,
+                            log_relation=log_relation,
+                            file_id = file_id
+                            **kwargs
+                        )
+                    )
+
+        else:
+            ingestion_ctrl = IngestionCtrl(file_name, container_folder_path)
+            meta = {
+                "ingestion_ctrl": asdict(ingestion_ctrl),
+                "dataset_service_of": ingestion_ctrl.file_name
+                }
+            df_with_meta = MetadataDataFrame(data, meta=meta)
+            written_table = save_as_evolve_schema_table(session, df_with_meta, temp_output_relation, table_type)
+            
+            unpacked_nested_tables = main(
+                        session,
+                        extract_params_for_unpacking( 
+                            input_relation=written_table,
+                            output_schema=output_schema,
+                            log_relation=log_relation,
+                            file_id = file_id,
+                            **kwargs
+                        )
+                    )
+        
+        # clean temporary table
+        session.sql(f'drop table {temp_output_relation}').collect()
+        
+        summary = dict(
+            entry_table = written_table,
+            unpack_nested_tables = unpacked_nested_tables,
+            logs = log_relation
+        )
+        return summary
+    
+    
+    return split_and_read_json(**kwargs)
+
+
+###########################################################################################
+datatype_conversion_order
+###########################################################################################
+# logger = Logger.logger
+# ? Temporary disbale logger
+#   to register this as a Snowpark UDF
+# todo: write File Handler to Stage
+
+# @Logger.log()
+def get_highest_order_dtype(input_dtypes: list) -> str:
+    """get_highest_order_dtype
+
+    # !LOSSLESS DATATYPE CONVERSION PRINCIPLES
+        : convert from one type to another without losing information, 
+        with a strict number of conversion operations are allowed, that the datatype in the higher order in the hierachy should be chosen the present the lowers if exists.
+        #*Precedence Hierachy
+            string < null
+            string < double < float < int 
+            string < array
+            string < object
+            string < bool
+
+    Args:
+       input_dtypes (list):  dtype instances detected from a field/column
+
+    Returns:
+        str: the highest order dtype to cast all values of this field to
+    """
+
+    precedence_hierarchy = [
+        ("varchar", "double", "float", "int"),
+        ("varchar", "object"),
+        ("varchar", "array"),
+        ("varchar", "boolean"),
+    ]
+    
+    snowpark_type_mapping = dict(
+        varchar = 'string'
+    )
+    
+    # get distinct dtypes
+    dtypes = set(input_dtypes)
+    matched_prec_hierachy = list()
+    highest_order_dtype = str()
+
+    for input_dtype in dtypes:
+        terminate = False
+        for group_idx, group in enumerate(precedence_hierarchy):
+            for prec_order, dtype in enumerate(group):
+                if input_dtype.lower() in dtype:
+                    matched_prec_hierachy.append((group_idx, prec_order, dtype))
+                    terminate = True
+                    break
+            if terminate:
+                break
+                    
+    # logger.debug('The precendence hierachy order of provided inputs are: %s', 
+    #              ''.join([f'\n\t\t{str(x)}' for x in matched_prec_hierachy]))
+    try:
+        groups, prec_orders, dtypes = zip(*matched_prec_hierachy)
+        distinct_groups = list(set(groups))
+        # logger.debug('Provided inputs are in %s different group(s).', len(distinct_groups))
+        match len(distinct_groups):
+            case n if n > 1:
+                highest_order_dtype = "varchar"
+            case n if n == 1:
+                cur_highest_pres = min(prec_orders)
+                highest_order_dtype = precedence_hierarchy[distinct_groups[0]][
+                    cur_highest_pres
+                ]
+        # logger.info('Highest precedence order dtype is %s', highest_order_dtype)
+    except:
+        # logger.warning('Provided inputs are not in any pre-defined precedence groups. Assigned Variant')
+        highest_order_dtype = 'varchar'
+        
+    # mapped with snowpark types
+    highest_order_dtype = snowpark_type_mapping.get(highest_order_dtype,highest_order_dtype)
+    return highest_order_dtype.upper()
+
+###########################################################################################
+evolve_schema
+###########################################################################################
+import snowflake.snowpark as snowpark
+
+
+def debug(session: snowpark.Session):
+    pass
+
+def evolve_schema(
+        session: snowpark.Session, 
+        to_merge: list,
+        target_relation: str
+        ) -> list: 
+    
+    try:
+        cur_cols = session.table(target_relation).columns
+    
+        new_cols =  set(to_merge) - set(cur_cols)
+        table_ddl_resolves = [f"alter table {target_relation} add column {col} VARCHAR;" for col in new_cols]
+        
+        for ddl in table_ddl_resolves:
+            session.sql(ddl).collect() #trigger lazy operation
+        return new_cols
+    except: #TODO: Investigate snowpark exception
+        return 
+
+###########################################################################################
+save_as_table_
+###########################################################################################
+import snowflake.snowpark as snowpark
+
+
+from dataclasses import dataclass, field
+from procedures.libs.metadata import MetadataDataFrame
+import snowflake.snowpark as snowpark
+import snowflake.snowpark.functions as F
+import snowflake.snowpark.types as T
+
+from typing import Literal
+from procedures.libs.evolve_schema import evolve_schema
+
+
+config=dict(
+    name=__file__,
+    imports=[
+        (
+            "libs/metadata.py",
+            "procedures.libs.metadata",
+        )
+    ]
+)
+
+def save_as_evolve_schema_table(
+    session: snowpark.Session,
+    dataframe: MetadataDataFrame,
+    target_relation: str,
+    table_type: Literal['', 'temp', 'temporary', 'transient'] = ''
+):
+    meta_col_names, meta_col_values = zip(*[(k, F.lit(v)) for k, v in dataframe.meta.items()])
+    
+    df = session.create_dataframe(dataframe.data)
+    df = df.with_columns(
+        meta_col_names,
+        meta_col_values
+    )
+    
+    new_cols = evolve_schema(
+        session=session,
+        to_merge = df.columns,
+        target_relation=target_relation
+    )
+
+    df.write.mode("append").save_as_table(
+        target_relation, 
+        table_type =table_type,
+        column_order="name"
+            )
+    
+    msg = f"Written to {target_relation}"
+    return target_relation
